@@ -4,6 +4,7 @@ inputs:
   before-script:        { required: false, default: '' }
   ccache-prefix:        { required: false, default: '' }
   ccache-enabled:       { required: false, default: 'true' }
+  ccache-maxsize:       { required: false, default: '1G' }
   rosdep-enabled:       { required: false, default: 'true' }
   rosdep-install-args:  { required: false, default: '-iry' }
   add-ros-ppa:          { required: false, default: 'true' }
@@ -36,26 +37,34 @@ runs:
         sudo rosdep init || true
         rosdep update --include-eol-distros
 
-    - name: Install ccache
+    - name: Configure ccache
+      id: ccache
       if: inputs.ccache-enabled == 'true'
       shell: bash
-      run: brew install ccache
-
-    - name: Prepare ccache timestamp
-      if: inputs.ccache-enabled == 'true'
-      id: ccache_timestamp_macos
-      shell: bash
+      env:
+        INPUT_CCACHE_PREFIX: ${{ inputs.ccache-prefix }}
+        INPUT_CCACHE_MAXSIZE: ${{ inputs.ccache-maxsize }}
       run: |
-        date -u +"::set-output name=timestamp::%Y-%m-%d-%H;%M;%S"
+        brew install ccache
+        bash "${GITHUB_ACTION_PATH//\\//}/../scripts/configure-ccache.sh"
 
+    # Restore and save are separate steps rather than one actions/cache: its post step re-evaluates
+    # `path`, and inside a composite action the steps context it needs is gone by then, so the save
+    # is skipped with only "Input required and not supplied: path" in the log.
     - name: Restore cache
-      if: inputs.ccache-enabled == 'true'
-      uses: actions/cache@v4
+      if: steps.ccache.outputs.dir != ''
+      uses: actions/cache/restore@v4
       with:
-        path: ${{ inputs.ccache-prefix }}/.ccache
-        key:   ${{ inputs.ccache-prefix }}-macos-ccache-${{ steps.ccache_timestamp_macos.outputs.timestamp }}
-        restore-keys: |
-          ${{ inputs.ccache-prefix }}-macos-ccache-
+        path: ${{ steps.ccache.outputs.dir }}
+        key: ${{ steps.ccache.outputs.key }}
+        restore-keys: ${{ steps.ccache.outputs.restore_key }}
+
+    # Counters live inside CCACHE_DIR, which the restore just repopulated, so zero them to make the
+    # statistics below describe this job alone. See the README, "Reading the numbers".
+    - name: Zero ccache statistics
+      if: steps.ccache.outputs.dir != ''
+      shell: bash
+      run: ccache -z
 
     - name: Build upstream workspace
       if: inputs.vcs-file != ''
@@ -66,14 +75,10 @@ runs:
         vcs import --input "$GITHUB_WORKSPACE/${{ inputs.target-path }}/${{ inputs.vcs-file }}" $GITHUB_WORKSPACE/upstream_ws/src
         if [ $? -ge 1 ]; then return 1; fi
         cd $GITHUB_WORKSPACE/upstream_ws
-        if [ "${{ inputs.rosdep-enabled }}" = "true" ]]; then
+        if [ "${{ inputs.rosdep-enabled }}" = "true" ]; then
           rosdep install --from-paths src ${{ inputs.rosdep-install-args }}
         fi
-        if [ "${{ inputs.ccache-enabled }}" = "true" ]]; then
-          colcon build --event-handlers desktop_notification- status- terminal_title- --cmake-args -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ${{ inputs.target-args }}
-        else
-          colcon build --event-handlers desktop_notification- status- terminal_title- --cmake-args ${{ inputs.target-args }}
-        fi
+        colcon build --event-handlers desktop_notification- status- terminal_title- --cmake-args ${{ inputs.upstream-args }}
         if [ $? -ge 1 ]; then return 1; fi
 
     - name: Build target workspace
@@ -84,14 +89,10 @@ runs:
           source $GITHUB_WORKSPACE/upstream_ws/install/setup.bash
         fi
         cd $GITHUB_WORKSPACE/${{ inputs.target-path }}/../
-        if [ "${{ inputs.rosdep-enabled }}" = "true" ]]; then
+        if [ "${{ inputs.rosdep-enabled }}" = "true" ]; then
           rosdep install --from-paths src ${{ inputs.rosdep-install-args }}
         fi
-        if [ "${{ inputs.ccache-enabled }}" = "true" ]]; then
-          colcon build --event-handlers desktop_notification- status- terminal_title- --cmake-args -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ${{ inputs.target-args }}
-        else
-          colcon build --event-handlers desktop_notification- status- terminal_title- --cmake-args ${{ inputs.target-args }}
-        fi
+        colcon build --event-handlers desktop_notification- status- terminal_title- --cmake-args ${{ inputs.target-args }}
         if [ $? -ge 1 ]; then return 1; fi
 
     - name: Run tests
@@ -104,3 +105,18 @@ runs:
         if [ $? -ge 1 ]; then return 1; fi
         colcon test-result --verbose
         if [ $? -ge 1 ]; then return 1; fi
+
+    - name: Report ccache statistics
+      if: ${{ !cancelled() && steps.ccache.outputs.dir != '' }}
+      shell: bash
+      run: ccache -s
+
+    # Runs after a failed build too: a partially warmed cache is still worth keeping. The dir test
+    # covers a failure before Configure ccache, where there is nothing to save and no key to save it
+    # under.
+    - name: Save cache
+      if: ${{ !cancelled() && steps.ccache.outputs.dir != '' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.ccache.outputs.dir }}
+        key: ${{ steps.ccache.outputs.key }}
